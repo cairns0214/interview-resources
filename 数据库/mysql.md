@@ -1,3 +1,43 @@
+<!-- TOC -->
+
+- [索引](#索引)
+  - [何为索引？有什么用？](#何为索引有什么用)
+  - [索引的优缺点](#索引的优缺点)
+    - [优点](#优点)
+    - [缺点](#缺点)
+  - [索引的底层数据结构](#索引的底层数据结构)
+    - [哈希表](#哈希表)
+      - [mysql为什么不使用哈希表作为索引的数据结构呢？](#mysql为什么不使用哈希表作为索引的数据结构呢)
+    - [B树&B+树](#b树b树)
+  - [MyISAM引擎和InnoDB引擎索引实现的区别](#myisam引擎和innodb引擎索引实现的区别)
+  - [聚集索引和非聚集索引](#聚集索引和非聚集索引)
+    - [聚集索引](#聚集索引)
+      - [优点](#优点-1)
+      - [缺点](#缺点-1)
+    - [非聚集索引](#非聚集索引)
+      - [优点](#优点-2)
+      - [缺点](#缺点-2)
+  - [覆盖索引](#覆盖索引)
+  - [创建索引的注意事项](#创建索引的注意事项)
+  - [使用索引的一些建议](#使用索引的一些建议)
+- [事务](#事务)
+  - [事务的特性(ACID)](#事务的特性acid)
+  - [并发事务带来的问题](#并发事务带来的问题)
+    - [不可重复读和幻读的区别](#不可重复读和幻读的区别)
+  - [事务的隔离级别](#事务的隔离级别)
+- [日志](#日志)
+  - [redo log](#redo-log)
+    - [刷盘时机](#刷盘时机)
+      - [为什么一个没有提交事务的redo log记录也可能会刷盘](#为什么一个没有提交事务的redo-log记录也可能会刷盘)
+    - [redo日志文件组](#redo日志文件组)
+  - [binlog](#binlog)
+    - [记录格式](#记录格式)
+    - [写入机制](#写入机制)
+    - [binlog 和 redo log的区别](#binlog-和-redo-log的区别)
+  - [undo log](#undo-log)
+
+<!-- /TOC -->
+
 # 索引
 ## 何为索引？有什么用？
 索引是一种用于快速查询和检索数据的数据结构。常见的索引结构有B树、B+树和Hash。
@@ -105,6 +145,48 @@ MySQL日志主要包括错误日志、查询日志、慢查询日志、事务日
 ## redo log
 *redo log*(重做日志)是InnoDB存储引擎独有的，它让MySQL拥有了奔溃恢复能力
 > 比如MySQL实例挂了或宕机了，重启时，InnoDB存储引擎会使用redo log恢复数据，保证数据的持久性和完整性
+>
+>每条redo记录由"表空间号+数据页号+偏移量+修改数据长度+具体修改的数据"组成
 
 mysql中数据是以页为单位，查询一条记录，会从硬盘把一页的数据加载出来，加载出来的数据叫数据页，放到Buffer Pool中，后续的查询都是先从Buffer pool中找，没有命中再去硬盘加载，减少硬盘IO开销提升性能。更新数据的时候，发现Buffer Pool里存在要更新的数据，就直接在Buffer Pool里更新，然后会把"在某个数据页上做了什么修改"记录到重做日志缓存(redo log buffer)里，接着刷盘到redo log文件里。
+![redo log交互](https://cdn.jsdelivr.net/gh/cairns0214/picture@master/img20211218174241.png)
 
+### 刷盘时机
+InnoDB存储引擎为redo log的刷盘策略提供了innodb_flush_log_ar_trx_commit参数，它支持三种策略
+* **0**：设置为0的时候，表示每次事务提交时不进行刷盘操作
+  * 如果mysql挂了或宕机可能会有1s的数据丢失
+* **1**：设置为1的时候，表示每次数据提交时都将进行刷盘操作(默认值)
+  * 只要事务提交成功，redo log记录就一定在硬盘里，不会有任何数据丢失
+* **2**：设置为2的时候，表示每次事务提交时都只把redo log buffer内容写入page cache
+  * 只要事务提交成功，redo log buffer中的内容会写入到文件系统缓存(page cache)。mysql挂了不会有任何数据丢失，宕机可能会有1s数据的丢失
+
+innodb_flush_log_at_trx_commit 参数默认为 1 ，也就是说当事务提交时会调用 fsync 对 redo log 进行刷盘。另外，InnoDB 存储引擎有一个后台线程，每隔1 秒，就会把 redo log buffer 中的内容写到文件系统缓存（page cache），然后调用 fsync 刷盘。
+![redo刷盘操作](https://cdn.jsdelivr.net/gh/cairns0214/picture@master/img20211218175235.png)
+
+#### 为什么一个没有提交事务的redo log记录也可能会刷盘
+事务执行过程redo log记录是会写入redo log buffer中，这些redo log记录会被后台线程刷盘。除了后台线程每秒1次的轮询操作，还有一种情况，当 redo log buffer 占用的空间即将达到 innodb_log_buffer_size 一半的时候，后台线程会主动刷盘。
+![20211218175502](https://cdn.jsdelivr.net/gh/cairns0214/picture@master/img20211218175502.png)
+
+### redo日志文件组
+硬盘上存储的 redo log 日志文件不只一个，而是以一个日志文件组的形式出现的，每个的redo日志文件大小都是一样的。它采用的是环形数组形式，从头开始写，写到末尾又回到头循环写。在个日志文件组中还有两个重要的属性，分别是 write pos、checkpoint
+* write pos 是当前记录的位置，一边写一边后移
+* checkpoint 是当前要擦除的位置，也是往后推移
+
+每次刷盘 redo log 记录到日志文件组中，write pos 位置就会后移更新。每次 MySQL 加载日志文件组恢复数据时，会清空加载过的 redo log 记录，并把 checkpoint 后移更新。write pos 和 checkpoint 之间的还空着的部分可以用来写入新的 redo log 记录。如果 write pos 追上 checkpoint ，表示日志文件组满了，这时候不能再写入新的 redo log 记录，MySQL 得停下来，清空一些记录，把 checkpoint 推进一下。
+
+## binlog
+mysql的逻辑日志，记录内容是语句的原始逻辑，类似于"给ID=2这一行的c字段加1"，属于mysql server层，不管用什么存储引擎，只要发生了表数据更新，都会产生binlog
+### 记录格式
+* **statement**：记录的内容是sql语句原文
+* **row**：除了sql语句还包含了具体的操作数据，需要通过mysqlbinlog工具解析
+* **mixed**：判断这条数据是否可能引起数据不一致，如果是，就用row格式，否则就用statement格式
+### 写入机制
+事务执行过程中，先把日志写入到binlog cache中，事务提交的时候，把binlog cache写到binlog文件中。一个事务的binlog不能被拆开，无论这个事务多大，也要确保一次性写入，所以系统会给每个线程分配一块内存作为binlog cache。可以通过binlog_cache_size参数控制单个线程binlog cache大小，如果存储内容超过了这个参数，就要暂存到存盘(swap)中
+
+### binlog 和 redo log的区别
+* redo log让innodb存储引擎拥有了奔溃恢复能力
+* binlog保证了mysql集群架构的数据一致性
+* redo log在事务执行过程中可以不断写入，而binlog只有在提交事务时才写入
+
+## undo log
+通过undo log实现异常回滚，来保证事务的原子性
